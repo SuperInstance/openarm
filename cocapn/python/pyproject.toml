@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "cocapn-openarm"
+version = "0.1.0"
+description = "Constraint-aware safety envelope + PLATO fleet connectivity for OpenArm"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.8"
+authors = [
+    {name = "Cocapn Fleet", email = "fleet@cocapn.ai"},
+]
+keywords = ["robotics", "constraint", "safety", "openarm", "eisenstein", "fleet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Robotics",
+]
+
+[project.urls]
+Homepage = "https://github.com/SuperInstance/openarm"
+Documentation = "https://github.com/SuperInstance/openarm/tree/main/cocapn/docs"
+Repository = "https://github.com/SuperInstance/openarm"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cocapn_openarm*"]
