@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenArm Constraint Safety — Live Demo</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code', monospace; overflow: hidden; }
+#header { text-align: center; padding: 12px; background: #111118; border-bottom: 1px solid #222; }
+#header h1 { font-size: 18px; color: #7fdbca; }
+#header p { font-size: 12px; color: #666; margin-top: 4px; }
+#container { display: flex; height: calc(100vh - 70px); }
+.panel { flex: 1; position: relative; border-right: 1px solid #1a1a2e; }
+.panel:last-child { border-right: none; }
+canvas { width: 100%; height: 100%; }
+.label { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); font-size: 14px; font-weight: bold; padding: 6px 16px; border-radius: 4px; z-index: 10; white-space: nowrap; }
+.label-unsafe { background: #441111; color: #ff6b6b; border: 1px solid #662222; }
+.label-safe { background: #114422; color: #7fdbca; border: 1px solid #226633; }
+#stats { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(10,10,15,0.9); border-top: 1px solid #222; display: flex; justify-content: space-around; padding: 8px; font-size: 11px; z-index: 10; }
+.stat { text-align: center; }
+.stat-value { font-size: 16px; font-weight: bold; margin-top: 2px; }
+.good { color: #7fdbca; }
+.bad { color: #ff6b6b; }
+.warn { color: #ffd93d; }
+#controls { position: absolute; bottom: 50px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; z-index: 20; }
+button { background: #1a1a2e; color: #e0e0e0; border: 1px solid #333; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; }
+button:hover { background: #252540; border-color: #555; }
+button.active { background: #114422; border-color: #7fdbca; color: #7fdbca; }
+#toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); background: #ff6b6b; color: #fff; padding: 8px 20px; border-radius: 4px; font-size: 13px; opacity: 0; transition: opacity 0.3s; z-index: 100; pointer-events: none; }
+#toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>⚒️ OpenArm × Cocapn — Constraint Safety Demo</h1>
+  <p>Left: <span style="color:#ff6b6b">UNSAFE (raw motor commands)</span> &nbsp;|&nbsp; Right: <span style="color:#7fdbca">CONSTRAINT-CHECKED (Eisenstein safety envelope)</span> &nbsp;|&nbsp; Space: chaos event &nbsp;|&nbsp; R: reset</p>
+</div>
+<div id="container">
+  <div class="panel" id="panel-unsafe">
+    <div class="label label-unsafe">⚠ UNPROTECTED</div>
+    <canvas id="canvas-unsafe"></canvas>
+    <div id="stats">
+      <div class="stat"><div>Commands</div><div class="stat-value" id="u-cmds">0</div></div>
+      <div class="stat"><div>Violations</div><div class="stat-value bad" id="u-viol">0</div></div>
+      <div class="stat"><div>Joint Damage</div><div class="stat-value bad" id="u-dmg">0%</div></div>
+      <div class="stat"><div>Status</div><div class="stat-value" id="u-status">OK</div></div>
+    </div>
+  </div>
+  <div class="panel" id="panel-safe">
+    <div class="label label-safe">✓ CONSTRAINT-CHECKED</div>
+    <canvas id="canvas-safe"></canvas>
+    <div id="stats">
+      <div class="stat"><div>Commands</div><div class="stat-value" id="s-cmds">0</div></div>
+      <div class="stat"><div>Blocked</div><div class="stat-value warn" id="s-block">0</div></div>
+      <div class="stat"><div>Safety Score</div><div class="stat-value good" id="s-score">1.00</div></div>
+      <div class="stat"><div>Status</div><div class="stat-value good" id="s-status">SAFE</div></div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<div id="controls">
+  <button id="btn-auto" class="active">Auto Demo</button>
+  <button id="btn-chaos">💀 Chaos Event</button>
+  <button id="btn-reset">Reset</button>
+  <button id="btn-speed">Speed: 1×</button>
+</div>
+
+<script>
+// ── Configuration ──
+const NUM_JOINTS = 6;
+const SEG_LENGTHS = [100, 80, 65, 50, 40, 30]; // px per segment
+const JOINT_LIMITS = Array(NUM_JOINTS).fill(null).map(() => ({ min: -Math.PI, max: Math.PI }));
+const EPS = 0.001;
+
+// ── State ──
+let autoMode = true;
+let speedMult = 1;
+let time = 0;
+
+function makeArmState() {
+  return {
+    angles: Array(NUM_JOINTS).fill(0),
+    targets: Array(NUM_JOINTS).fill(0),
+    damage: Array(NUM_JOINTS).fill(0), // 0-1 damage per joint
+    totalCmds: 0,
+    violations: 0,
+    blocked: 0,
+    estop: false,
+    sparks: [],
+    ghostTrails: [],
+  };
+}
+
+let unsafeArm = makeArmState();
+let safeArm = makeArmState();
+
+// ── Canvas Setup ──
+function setupCanvas(id) {
+  const canvas = document.getElementById(id);
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * devicePixelRatio;
+  canvas.height = rect.height * devicePixelRatio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  return { canvas, ctx, w: rect.width, h: rect.height };
+}
+
+let cUnsafe, cSafe;
+
+function initCanvases() {
+  cUnsafe = setupCanvas('canvas-unsafe');
+  cSafe = setupCanvas('canvas-safe');
+}
+
+// ── Kinematics ──
+function forwardKinematics(angles) {
+  let pts = [{ x: 0, y: 0 }];
+  let angle = -Math.PI / 2; // start pointing up
+  for (let i = 0; i < angles.length; i++) {
+    angle += angles[i];
+    const prev = pts[pts.length - 1];
+    pts.push({
+      x: prev.x + SEG_LENGTHS[i] * Math.cos(angle),
+      y: prev.y + SEG_LENGTHS[i] * Math.sin(angle),
+    });
+  }
+  return pts;
+}
+
+// ── Eisenstein Workspace ──
+function eisensteinNorm(a, b) {
+  return a * a - a * b + b * b;
+}
+
+function checkEisenstein(x, y, radius, scale) {
+  const inv = 1 / scale;
+  const invSqrt3 = 1 / Math.sqrt(3);
+  const a = Math.round(x * inv - y * inv * invSqrt3);
+  const b = Math.round(2 * y * inv * invSqrt3);
+  return Math.sqrt(eisensteinNorm(a, b)) <= radius;
+}
+
+// ── Drawing ──
+function drawArm(ctx, w, h, state, isSafe, hexOverlay) {
+  ctx.clearRect(0, 0, w, h);
+
+  // Background grid
+  ctx.strokeStyle = '#151520';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < w; x += 30) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 0; y < h; y += 30) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  // Base position (bottom center)
+  const baseX = w / 2;
+  const baseY = h * 0.85;
+
+  // Draw Eisenstein workspace hex boundary (safe arm only)
+  if (hexOverlay) {
+    ctx.save();
+    ctx.translate(baseX, baseY);
+    ctx.beginPath();
+    const hexR = 260;
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI / 3) * i - Math.PI / 2;
+      const px = hexR * Math.cos(a);
+      const py = hexR * Math.sin(a);
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(127, 219, 202, 0.25)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(127, 219, 202, 0.03)';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Ghost trails (safe arm shows rejected positions as ghosts)
+  if (hexOverlay) {
+    ctx.save();
+    ctx.translate(baseX, baseY);
+    state.ghostTrails.forEach((g, i) => {
+      const pts = forwardKinematics(g);
+      ctx.globalAlpha = 0.08 * (1 - i / state.ghostTrails.length);
+      ctx.beginPath();
+      pts.forEach((p, j) => {
+        if (j === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.strokeStyle = '#ff6b6b';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // Forward kinematics
+  const pts = forwardKinematics(state.angles);
+
+  ctx.save();
+  ctx.translate(baseX, baseY);
+
+  // Draw arm segments
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+
+    // Joint damage color
+    const dmg = state.damage[i] || 0;
+    let segColor;
+    if (isSafe) {
+      segColor = `rgb(${Math.round(40 + dmg * 60)}, ${Math.round(180 - dmg * 100)}, ${Math.round(160 - dmg * 100)})`;
+    } else {
+      segColor = `rgb(${Math.round(60 + dmg * 195)}, ${Math.round(120 - dmg * 80)}, ${Math.round(120 - dmg * 80)})`;
+    }
+
+    // Segment
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.strokeStyle = segColor;
+    ctx.lineWidth = 8 - i;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    // Joint dot
+    ctx.beginPath();
+    ctx.arc(p1.x, p1.y, 5 - i * 0.5, 0, Math.PI * 2);
+    ctx.fillStyle = dmg > 0.5 ? '#ff6b6b' : (isSafe ? '#7fdbca' : '#666');
+    ctx.fill();
+  }
+
+  // End effector
+  const ee = pts[pts.length - 1];
+  ctx.beginPath();
+  ctx.arc(ee.x, ee.y, 6, 0, Math.PI * 2);
+  ctx.fillStyle = state.estop ? '#ff6b6b' : (isSafe ? '#7fdbca' : '#999');
+  ctx.fill();
+
+  // Sparks (damage visualization)
+  state.sparks = state.sparks.filter(s => s.life > 0);
+  state.sparks.forEach(s => {
+    s.x += s.vx;
+    s.y += s.vy;
+    s.vy += 0.3;
+    s.life -= 0.02;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 2, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255, 107, 107, ${s.life})`;
+    ctx.fill();
+  });
+
+  ctx.restore();
+
+  // Base mount
+  ctx.fillStyle = '#333';
+  ctx.fillRect(baseX - 20, baseY, 40, 10);
+  ctx.fillStyle = '#444';
+  ctx.fillRect(baseX - 30, baseY + 10, 60, 6);
+
+  // Joint angle indicators
+  ctx.save();
+  ctx.translate(10, 10);
+  ctx.font = '10px monospace';
+  for (let i = 0; i < NUM_JOINTS; i++) {
+    const dmg = state.damage[i];
+    const val = state.angles[i];
+    const pct = ((val + Math.PI) / (2 * Math.PI) * 100).toFixed(0);
+    ctx.fillStyle = dmg > 0.5 ? '#ff6b6b' : dmg > 0.2 ? '#ffd93d' : '#666';
+    ctx.fillText(`J${i}: ${(val * 180 / Math.PI).toFixed(0)}° (${pct}%) dmg:${(dmg * 100).toFixed(0)}%`, 4, 14 + i * 14);
+  }
+  ctx.restore();
+}
+
+// ── Physics / Commands ──
+function generateTrajectory(t) {
+  // Smooth sinusoidal targets with occasional sharp changes
+  const targets = [];
+  for (let i = 0; i < NUM_JOINTS; i++) {
+    const freq = 0.3 + i * 0.15;
+    const amp = 1.2 + Math.sin(t * 0.1 + i) * 0.8;
+    targets.push(Math.sin(t * freq + i * 1.5) * amp);
+  }
+  return targets;
+}
+
+function chaosEvent() {
+  // Random violent target — simulates a bug or malicious command
+  const targets = [];
+  for (let i = 0; i < NUM_JOINTS; i++) {
+    targets.push((Math.random() - 0.5) * 12); // Way outside limits
+  }
+  return targets;
+}
+
+function applyTargetsUnsafe(state, targets) {
+  // UNSAFE: just slam to target, no checking
+  for (let i = 0; i < NUM_JOINTS; i++) {
+    const target = targets[i];
+    state.totalCmds++;
+
+    // Move toward target
+    const diff = target - state.angles[i];
+    state.angles[i] += diff * 0.15 * speedMult;
+
+    // Check if outside limits → DAMAGE
+    const limit = JOINT_LIMITS[i];
+    if (state.angles[i] < limit.min || state.angles[i] > limit.max) {
+      state.violations++;
+      state.damage[i] = Math.min(1, state.damage[i] + 0.02 * speedMult);
+
+      // Sparks at the damaged joint
+      const pts = forwardKinematics(state.angles);
+      if (pts[i]) {
+        for (let s = 0; s < 3; s++) {
+          state.sparks.push({
+            x: pts[i].x, y: pts[i].y,
+            vx: (Math.random() - 0.5) * 6,
+            vy: (Math.random() - 0.5) * 6 - 2,
+            life: 1,
+          });
+        }
+      }
+    }
+
+    // Extreme damage = joint locks up
+    if (state.damage[i] > 0.9) {
+      state.angles[i] = state.angles[i] * 0.95; // drift to stuck
+    }
+  }
+}
+
+function applyTargetsSafe(state, targets) {
+  // SAFE: constraint-check each target
+  const ghostTargets = [];
+  let anyBlocked = false;
+
+  for (let i = 0; i < NUM_JOINTS; i++) {
+    let target = targets[i];
+    state.totalCmds++;
+
+    // Constraint check
+    const limit = JOINT_LIMITS[i];
+    if (target < limit.min || target > limit.max) {
+      state.blocked++;
+      anyBlocked = true;
+      ghostTargets.push([...state.angles]); // Save ghost
+
+      // Clamp to safe boundary
+      target = Math.max(limit.min, Math.min(limit.max, target));
+    }
+
+    // Smooth interpolation to clamped target
+    const diff = target - state.angles[i];
+    state.angles[i] += diff * 0.15 * speedMult;
+  }
+
+  // Show ghost trails for rejected commands
+  if (anyBlocked && ghostTargets.length > 0) {
+    state.ghostTrails.unshift(ghostTargets[ghostTargets.length - 1]);
+    if (state.ghostTrails.length > 8) state.ghostTrails.pop();
+  }
+
+  // No damage accumulation — constraints prevent it
+}
+
+// ── Auto Demo Patterns ──
+let demoPhase = 0;
+let demoTimer = 0;
+const DEMO_PHASES = [
+  { name: 'Smooth motion', duration: 300, fn: generateTrajectory },
+  { name: 'Acceleration', duration: 200, fn: t => generateTrajectory(t * 2) },
+  { name: 'CHAOS EVENT', duration: 60, fn: chaosEvent },
+  { name: 'Recovery', duration: 200, fn: t => generateTrajectory(t * 0.5) },
+  { name: 'Figure-8', duration: 300, fn: t => {
+    const targets = [];
+    for (let i = 0; i < NUM_JOINTS; i++) {
+      targets.push(Math.sin(t * 0.4 + i * 0.8) * Math.cos(t * 0.2 + i) * 1.5);
+    }
+    return targets;
+  }},
+  { name: 'CHAOS EVENT', duration: 80, fn: chaosEvent },
+  { name: 'Windy day', duration: 300, fn: t => {
+    const targets = [];
+    for (let i = 0; i < NUM_JOINTS; i++) {
+      const base = Math.sin(t * 0.3 + i) * 0.8;
+      const gust = Math.sin(t * 3 + i * 7) * 1.5;
+      targets.push(base + gust);
+    }
+    return targets;
+  }},
+];
+
+// ── Main Loop ──
+let lastTime = 0;
+let pendingChaos = false;
+
+function update(timestamp) {
+  const dt = Math.min(timestamp - lastTime, 50);
+  lastTime = timestamp;
+  time += dt * 0.001 * speedMult;
+
+  // Auto demo
+  if (autoMode) {
+    demoTimer += speedMult;
+    const phase = DEMO_PHASES[demoPhase];
+    if (demoTimer >= phase.duration) {
+      demoTimer = 0;
+      demoPhase = (demoPhase + 1) % DEMO_PHASES.length;
+    }
+
+    const targets = DEMO_PHASES[demoPhase].fn(time);
+    applyTargetsUnsafe(unsafeArm, targets);
+    applyTargetsSafe(safeArm, targets);
+  }
+
+  if (pendingChaos) {
+    const targets = chaosEvent();
+    applyTargetsUnsafe(unsafeArm, targets);
+    applyTargetsSafe(safeArm, targets);
+    pendingChaos = false;
+    showToast('💀 CHAOS EVENT — random violent commands sent to both arms');
+  }
+
+  // Draw
+  drawArm(cUnsafe.ctx, cUnsafe.w, cUnsafe.h, unsafeArm, false, false);
+  drawArm(cSafe.ctx, cSafe.w, cSafe.h, safeArm, true, true);
+
+  // Update stats
+  const uTotalDmg = unsafeArm.damage.reduce((a, b) => a + b, 0) / NUM_JOINTS;
+  document.getElementById('u-cmds').textContent = unsafeArm.totalCmds;
+  document.getElementById('u-viol').textContent = unsafeArm.violations;
+  document.getElementById('u-dmg').textContent = (uTotalDmg * 100).toFixed(0) + '%';
+  document.getElementById('u-dmg').className = 'stat-value ' + (uTotalDmg > 0.5 ? 'bad' : uTotalDmg > 0.2 ? 'warn' : 'good');
+  const uStatus = uTotalDmg > 0.8 ? 'DESTROYED' : uTotalDmg > 0.4 ? 'DAMAGED' : uTotalDmg > 0.1 ? 'DEGRADED' : 'OK';
+  document.getElementById('u-status').textContent = uStatus;
+  document.getElementById('u-status').className = 'stat-value ' + (uTotalDmg > 0.4 ? 'bad' : uTotalDmg > 0.1 ? 'warn' : 'good');
+
+  const sScore = safeArm.totalCmds > 0 ? (1 - safeArm.blocked / safeArm.totalCmds) : 1;
+  document.getElementById('s-cmds').textContent = safeArm.totalCmds;
+  document.getElementById('s-block').textContent = safeArm.blocked;
+  document.getElementById('s-score').textContent = sScore.toFixed(2);
+  document.getElementById('s-status').textContent = safeArm.estop ? 'E-STOP' : 'SAFE';
+
+  // Phase indicator
+  if (autoMode) {
+    const phaseName = DEMO_PHASES[demoPhase].name;
+    if (phaseName.includes('CHAOS')) {
+      showToast('💀 ' + phaseName);
+    }
+  }
+
+  requestAnimationFrame(update);
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ── Controls ──
+document.getElementById('btn-auto').addEventListener('click', function() {
+  autoMode = !autoMode;
+  this.classList.toggle('active');
+  this.textContent = autoMode ? 'Auto Demo' : 'Manual';
+});
+
+document.getElementById('btn-chaos').addEventListener('click', () => {
+  pendingChaos = true;
+});
+
+document.getElementById('btn-reset').addEventListener('click', () => {
+  unsafeArm = makeArmState();
+  safeArm = makeArmState();
+  demoPhase = 0;
+  demoTimer = 0;
+  time = 0;
+  showToast('🔄 Reset — both arms restored');
+});
+
+const speeds = [1, 2, 4, 0.5];
+let speedIdx = 0;
+document.getElementById('btn-speed').addEventListener('click', function() {
+  speedIdx = (speedIdx + 1) % speeds.length;
+  speedMult = speeds[speedIdx];
+  this.textContent = 'Speed: ' + speedMult + '×';
+});
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); pendingChaos = true; }
+  if (e.code === 'KeyR') {
+    unsafeArm = makeArmState();
+    safeArm = makeArmState();
+    demoPhase = 0;
+    demoTimer = 0;
+    showToast('🔄 Reset');
+  }
+});
+
+// ── Init ──
+window.addEventListener('resize', initCanvases);
+initCanvases();
+requestAnimationFrame(update);
+</script>
+</body>
+</html>
